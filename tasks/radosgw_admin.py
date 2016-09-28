@@ -262,6 +262,8 @@ def task(ctx, config):
             (err2, out2) = rgwadmin(ctx, dest_client,
                 ['metadata', 'get', 'bucket:{bucket_name}'.format(bucket_name=bucket_name2)],
                 check_status=True)
+            log.debug('metadata 1 %r', out1)
+            log.debug('metadata 2 %r', out2)
             assert out1 == out2
 
             # get the bucket.instance info and compare that
@@ -277,8 +279,10 @@ def task(ctx, config):
                 check_status=True)
             del out1['data']['bucket_info']['bucket']['pool']
             del out1['data']['bucket_info']['bucket']['index_pool']
+            del out1['data']['bucket_info']['bucket']['data_extra_pool']
             del out2['data']['bucket_info']['bucket']['pool']
             del out2['data']['bucket_info']['bucket']['index_pool']
+            del out2['data']['bucket_info']['bucket']['data_extra_pool']
             assert out1 == out2
 
         same_region = 0

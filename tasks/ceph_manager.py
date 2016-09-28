@@ -22,6 +22,10 @@ from teuthology.orchestra.remote import Remote
 from teuthology.orchestra import run
 from teuthology.exceptions import CommandFailedError
 
+try:
+    from subprocess import DEVNULL # py3k
+except ImportError:
+    DEVNULL = open(os.devnull, 'r+')
 
 DEFAULT_CONF_PATH = '/etc/ceph/ceph.conf'
 
@@ -294,6 +298,20 @@ class Thrasher:
             exp_remote.run(args=cmd)
             if imp_remote != exp_remote:
                 imp_remote.run(args=cmd)
+
+            # apply low split settings to each pool
+            for pool in self.ceph_manager.list_pools():
+                no_sudo_prefix = prefix[5:]
+                cmd = ("CEPH_ARGS='--filestore-merge-threshold 1 "
+                       "--filestore-split-multiple 1' sudo -E "
+                       + no_sudo_prefix + "--op apply-layout-settings --pool " + pool).format(id=osd)
+                proc = remote.run(args=cmd, wait=True, check_status=False, stderr=StringIO())
+                output = proc.stderr.getvalue()
+                if 'Couldn\'t find pool' in output:
+                    continue
+                if proc.exitstatus:
+                    raise Exception("ceph-objectstore-tool apply-layout-settings"
+                                    " failed with {status}".format(status=proc.exitstatus))
 
     def rm_past_intervals(self, osd=None):
         """
@@ -727,11 +745,11 @@ class Thrasher:
             for osd in self.live_osds:
                 # Ignore errors because live_osds is in flux
                 self.ceph_manager.osd_admin_socket(osd, command=['dump_ops_in_flight'],
-                                     check_status=False, timeout=30)
+                                     check_status=False, timeout=30, stdout=DEVNULL)
                 self.ceph_manager.osd_admin_socket(osd, command=['dump_blocked_ops'],
-                                     check_status=False, timeout=30)
+                                     check_status=False, timeout=30, stdout=DEVNULL)
                 self.ceph_manager.osd_admin_socket(osd, command=['dump_historic_ops'],
-                                     check_status=False, timeout=30)
+                                     check_status=False, timeout=30, stdout=DEVNULL)
             gevent.sleep(0)
 
     @log_exc
@@ -807,6 +825,7 @@ class ObjectStoreTool:
         self.pool = pool
         self.osd = kwargs.get('osd', None)
         self.object_name = kwargs.get('object_name', None)
+        self.do_revive = kwargs.get('do_revive', True)
         if self.osd and self.pool and self.object_name:
             if self.osd == "primary":
                 self.osd = self.manager.get_object_primary(self.pool,
@@ -844,14 +863,16 @@ class ObjectStoreTool:
         lines.append(cmd)
         return "\n".join(lines)
 
-    def run(self, options, args, stdin=None):
+    def run(self, options, args, stdin=None, stdout=None):
+        if stdout is None:
+            stdout = StringIO()
         self.manager.kill_osd(self.osd)
         cmd = self.build_cmd(options, args, stdin)
         self.manager.log(cmd)
         try:
             proc = self.remote.run(args=['bash', '-e', '-x', '-c', cmd],
                                    check_status=False,
-                                   stdout=StringIO(),
+                                   stdout=stdout,
                                    stderr=StringIO())
             proc.wait()
             if proc.exitstatus != 0:
@@ -859,7 +880,8 @@ class ObjectStoreTool:
                 error = proc.stdout.getvalue() + " " + proc.stderr.getvalue()
                 raise Exception(error)
         finally:
-            self.manager.revive_osd(self.osd)
+            if self.do_revive:
+                self.manager.revive_osd(self.osd)
 
 
 class CephManager:
@@ -1051,8 +1073,10 @@ class CephManager:
             check_status=False
         ).exitstatus
 
-    def osd_admin_socket(self, osd_id, command, check_status=True, timeout=0):
-        return self.admin_socket('osd', osd_id, command, check_status, timeout)
+    def osd_admin_socket(self, osd_id, command, check_status=True, timeout=0, stdout=None):
+        if stdout is None:
+            stdout = StringIO()
+        return self.admin_socket('osd', osd_id, command, check_status, timeout, stdout)
 
     def find_remote(self, service_type, service_id):
         """
@@ -1068,12 +1092,14 @@ class CephManager:
                           service_type, service_id)
 
     def admin_socket(self, service_type, service_id,
-                     command, check_status=True, timeout=0):
+                     command, check_status=True, timeout=0, stdout=None):
         """
         Remotely start up ceph specifying the admin socket
         :param command: a list of words to use as the command
                         to the admin socket
         """
+        if stdout is None:
+            stdout = StringIO()
         testdir = teuthology.get_testdir(self.ctx)
         remote = self.find_remote(service_type, service_id)
         args = [
@@ -1095,7 +1121,7 @@ class CephManager:
         args.extend(command)
         return remote.run(
             args=args,
-            stdout=StringIO(),
+            stdout=stdout,
             wait=True,
             check_status=check_status
             )
@@ -1170,15 +1196,17 @@ class CephManager:
             '0')
 
     def wait_run_admin_socket(self, service_type,
-                              service_id, args=['version'], timeout=75):
+                              service_id, args=['version'], timeout=75, stdout=None):
         """
         If osd_admin_socket call suceeds, return.  Otherwise wait
         five seconds and try again.
         """
+        if stdout is None:
+            stdout = StringIO()
         tries = 0
         while True:
             proc = self.admin_socket(service_type, service_id,
-                                     args, check_status=False)
+                                     args, check_status=False, stdout=stdout)
             if proc.exitstatus is 0:
                 break
             else:
@@ -1894,13 +1922,31 @@ class CephManager:
             remote = self.find_remote('osd', osd)
             self.log('kill_osd on osd.{o} '
                      'doing powercycle of {s}'.format(o=osd, s=remote.name))
-            assert remote.console is not None, ("powercycling requested "
-                                                "but RemoteConsole is not "
-                                                "initialized.  "
-                                                "Check ipmi config.")
+            self._assert_ipmi(remote)
             remote.console.power_off()
+        elif self.config.get('bdev_inject_crash') and self.config.get('bdev_inject_crash_probability'):
+            if random.uniform(0, 1) < self.config.get('bdev_inject_crash_probability', .5):
+                self.raw_cluster_cmd(
+                    '--', 'tell', 'osd.%d' % osd,
+                    'injectargs',
+                    '--bdev-inject-crash %d' % self.config.get('bdev_inject_crash'),
+                )
+                try:
+                    self.ctx.daemons.get_daemon('osd', osd, self.cluster).wait()
+                except:
+                    pass
+                else:
+                    raise RuntimeError('osd.%s did not fail' % osd)
+            else:
+                self.ctx.daemons.get_daemon('osd', osd, self.cluster).stop()
         else:
             self.ctx.daemons.get_daemon('osd', osd, self.cluster).stop()
+
+    @staticmethod
+    def _assert_ipmi(remote):
+        assert remote.console.has_ipmi_credentials, (
+            "powercycling requested but RemoteConsole is not "
+            "initialized.  Check ipmi config.")
 
     def blackhole_kill_osd(self, osd):
         """
@@ -1920,10 +1966,7 @@ class CephManager:
             remote = self.find_remote('osd', osd)
             self.log('kill_osd on osd.{o} doing powercycle of {s}'.
                      format(o=osd, s=remote.name))
-            assert remote.console is not None, ("powercycling requested "
-                                                "but RemoteConsole is not "
-                                                "initialized.  "
-                                                "Check ipmi config.")
+            self._assert_ipmi(remote)
             remote.console.power_on()
             if not remote.console.check_status(300):
                 raise Exception('Failed to revive osd.{o} via ipmi'.
@@ -1941,7 +1984,7 @@ class CephManager:
             # unhappy.  see #5924.
             self.wait_run_admin_socket('osd', osd,
                                        args=['dump_ops_in_flight'],
-                                       timeout=timeout)
+                                       timeout=timeout, stdout=DEVNULL)
 
     def mark_down_osd(self, osd):
         """
@@ -1980,11 +2023,7 @@ class CephManager:
             remote = self.find_remote('mon', mon)
             self.log('kill_mon on mon.{m} doing powercycle of {s}'.
                      format(m=mon, s=remote.name))
-            assert remote.console is not None, ("powercycling requested "
-                                                "but RemoteConsole is not "
-                                                "initialized.  "
-                                                "Check ipmi config.")
-
+            self._assert_ipmi(remote)
             remote.console.power_off()
         else:
             self.ctx.daemons.get_daemon('mon', mon, self.cluster).stop()
@@ -1998,11 +2037,7 @@ class CephManager:
             remote = self.find_remote('mon', mon)
             self.log('revive_mon on mon.{m} doing powercycle of {s}'.
                      format(m=mon, s=remote.name))
-            assert remote.console is not None, ("powercycling requested "
-                                                "but RemoteConsole is not "
-                                                "initialized.  "
-                                                "Check ipmi config.")
-
+            self._assert_ipmi(remote)
             remote.console.power_on()
             self.make_admin_daemon_dir(remote)
         self.ctx.daemons.get_daemon('mon', mon, self.cluster).restart()

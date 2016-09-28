@@ -43,10 +43,9 @@ source $(dirname $0)/common.sh
 
 init_ceph $git_ceph_url $sha1
 
-#id=$(lsb_release -s -i | tr A-Z a-z)
-#major=$(lsb_release -s -r | sed -s "s;\..*;;g")
-#codename="${id}${major}"
-releasedir=$base/$(lsb_release -si | tr ' ' '_')/WORKDIR
+distro=$( source /etc/os-release ; echo $ID )
+distro_version=$( source /etc/os-release ; echo $VERSION )
+releasedir=$base/$distro/WORKDIR
 #
 # git describe provides a version that is
 # a) human readable
@@ -67,7 +66,7 @@ function setup_rpmmacros() {
     if ! grep -q find_debuginfo_dwz_opts $HOME/.rpmmacros ; then
         echo '%_find_debuginfo_dwz_opts %{nil}' >> $HOME/.rpmmacros
     fi
-    if lsb_release -d -s | grep CentOS | grep -q 'release 7' ; then
+    if [ "x${distro}x" = "xcentosx" ] && echo $distro_version | grep -q '7' ; then
         if ! grep -q '%dist .el7' $HOME/.rpmmacros ; then
             echo '%dist .el7' >> $HOME/.rpmmacros
         fi
@@ -87,17 +86,24 @@ function build_package() {
     # options (otherwise parts of the source tree will be left out).
     #
     if [ "$suse" = true ] ; then
-        sudo zypper -n install bzip2 
+        sudo zypper -n install bzip2
     else
         sudo yum install -y bzip2
     fi
-    ./autogen.sh
-    ./configure $(flavor2configure $flavor) --with-debug --with-radosgw --with-fuse --with-libatomic-ops --with-gtk2 --with-nss
-    #
-    # use distdir= to set the name of the top level directory of the
-    # tarbal to match the desired version
-    #
-    make dist-bzip2
+    # autotools only works in jewel and below
+    if [[ ! -e "make-dist" ]] ; then
+        ./autogen.sh
+        ./configure $(flavor2configure $flavor) --with-debug --with-radosgw --with-fuse --with-libatomic-ops --with-gtk2 --with-nss
+
+        #
+        # use distdir= to set the name of the top level directory of the
+        # tarbal to match the desired version
+        #
+        make dist-bzip2
+    else
+        # kraken and above
+        ./make-dist
+    fi
     # Set up build area
     setup_rpmmacros
     if [ "$suse" = true ] ; then
@@ -112,12 +118,21 @@ function build_package() {
     cp ceph.spec ${buildarea}/SPECS
     mkdir -p ${buildarea}/RPMS
     mkdir -p ${buildarea}/BUILD
-    cp -a ceph-*.tar.bz2 ${buildarea}/SOURCES/.
+    CEPH_TARBALL=( ceph-*.tar.bz2 )
+    cp -a $CEPH_TARBALL ${buildarea}/SOURCES/.
     cp -a rpm/*.patch ${buildarea}/SOURCES || true
     (
         cd ${buildarea}/SPECS
         ccache=$(echo /usr/lib*/ccache)
         # Build RPMs
+        if [ "$suse" = true ]; then
+          sed -i -e '0,/%package/s//%debug_package\n&/' \
+                 -e 's/%{epoch}://g' \
+                 -e '/^Epoch:/d' \
+                 -e 's/%bcond_with ceph_test_package/%bcond_without ceph_test_package/' \
+                 -e "s/^Source0:.*$/Source0: $CEPH_TARBALL/" \
+                 ceph.spec
+        fi
         buildarea=`readlink -fn ${releasedir}`   ### rpm wants absolute path
         PATH=$ccache:$PATH rpmbuild -ba --define "_unpackaged_files_terminate_build 0" --define "_topdir ${buildarea}" ceph.spec
     )
